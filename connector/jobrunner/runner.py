@@ -256,7 +256,7 @@ class Database(object):
 
     def select_jobs(self, where, args):
         query = ("SELECT %s, uuid, id as seq, date_created, "
-                 "priority, eta, state "
+                 "priority, eta, state, retry "
                  "FROM queue_job WHERE %s" %
                  ('channel' if self.has_channel else 'NULL',
                   where))

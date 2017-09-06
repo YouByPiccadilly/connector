@@ -156,11 +156,11 @@ class ChannelJob(object):
     j1 comes before j2 before it has a smaller date_created
 
     >>> j1 = ChannelJob(None, None, 1,
-    ...                 seq=0, date_created=1, priority=9, eta=None)
+    ...                 seq=0, date_created=1, priority=9, eta=None, retry=0)
     >>> j1
     <ChannelJob 1>
     >>> j2 = ChannelJob(None, None, 2,
-    ...                 seq=0, date_created=2, priority=9, eta=None)
+    ...                 seq=0, date_created=2, priority=9, eta=None, retry=0)
     >>> j1 < j2
     True
 
@@ -168,23 +168,23 @@ class ChannelJob(object):
     despite having a creation date after j1 and j2
 
     >>> j3 = ChannelJob(None, None, 3,
-    ...                 seq=0, date_created=3, priority=2, eta=None)
+    ...                 seq=0, date_created=3, priority=2, eta=None, retry=0)
     >>> j3 < j1
     True
 
     j4 and j5 comes even before j3, because they have an eta
 
     >>> j4 = ChannelJob(None, None, 4,
-    ...                 seq=0, date_created=4, priority=9, eta=9)
+    ...                 seq=0, date_created=4, priority=9, eta=9, retry=0)
     >>> j5 = ChannelJob(None, None, 5,
-    ...                 seq=0, date_created=5, priority=9, eta=9)
+    ...                 seq=0, date_created=5, priority=9, eta=9, retry=0)
     >>> j4 < j5 < j3
     True
 
     j6 has same date_created and priority as j5 but a smaller eta
 
     >>> j6 = ChannelJob(None, None, 6,
-    ...                 seq=0, date_created=5, priority=9, eta=2)
+    ...                 seq=0, date_created=5, priority=9, eta=2, retry=0)
     >>> j6 < j4 < j5
     True
 
@@ -197,7 +197,7 @@ class ChannelJob(object):
     equal as they are different instances
 
     >>> j0 = ChannelJob(None, None, 1,
-    ...                 seq=0, date_created=1, priority=9, eta=None)
+    ...                 seq=0, date_created=1, priority=9, eta=None, retry=0)
     >>> j0 == j1
     False
     >>> j0 == j0
@@ -205,7 +205,7 @@ class ChannelJob(object):
     """
 
     def __init__(self, db_name, channel, uuid,
-                 seq, date_created, priority, eta):
+                 seq, date_created, priority, eta, retry):
         self.db_name = db_name
         self.channel = channel
         self.uuid = uuid
@@ -213,6 +213,7 @@ class ChannelJob(object):
         self.date_created = date_created
         self.priority = priority
         self.eta = eta
+        self.retry = retry
 
     def __repr__(self):
         return "<ChannelJob %s>" % self.uuid
@@ -241,11 +242,11 @@ class ChannelQueue(object):
 
     >>> q = ChannelQueue()
     >>> j1 = ChannelJob(None, None, 1,
-    ...                 seq=0, date_created=1, priority=1, eta=10)
+    ...                 seq=0, date_created=1, priority=1, eta=10, retry=0)
     >>> j2 = ChannelJob(None, None, 2,
-    ...                 seq=0, date_created=2, priority=1, eta=None)
+    ...                 seq=0, date_created=2, priority=1, eta=None, retry=0)
     >>> j3 = ChannelJob(None, None, 3,
-    ...                 seq=0, date_created=3, priority=1, eta=None)
+    ...                 seq=0, date_created=3, priority=1, eta=None, retry=0)
     >>> q.add(j1)
     >>> q.add(j2)
     >>> q.add(j3)
@@ -260,25 +261,33 @@ class ChannelQueue(object):
     def __init__(self):
         self._queue = PriorityQueue()
         self._eta_queue = PriorityQueue()
+        self._retryable_queue = PriorityQueue()
+        self._queues = (self._queue, self._eta_queue, self._retryable_queue)
 
     def __len__(self):
-        return len(self._eta_queue) + len(self._queue)
+        return sum(len(queue) for queue in self._queues)
 
     def __contains__(self, o):
-        return o in self._eta_queue or o in self._queue
+        return any(o in queue for queue in self._queues)
 
     def add(self, job):
+        if job.retry and job.eta:
+            self._retryable_queue.add(job)
         if job.eta:
             self._eta_queue.add(job)
         else:
             self._queue.add(job)
 
     def remove(self, job):
-        self._eta_queue.remove(job)
-        self._queue.remove(job)
+        for queue in self._queues:
+            queue.remove(job)
 
-    def pop(self, now):
-        if len(self._eta_queue) and self._eta_queue[0].eta <= now:
+    def pop(self, now, retryable_blocks=False):
+        if len(self._retryable_queue) and self._retryable_queue[0].eta <= now:
+            return self._retryable_queue.pop()
+        elif len(self._retryable_queue) and retryable_blocks:
+            return
+        elif len(self._eta_queue) and self._eta_queue[0].eta <= now:
             return self._eta_queue.pop()
         else:
             return self._queue.pop()
@@ -458,7 +467,7 @@ class Channel(object):
             return
         # yield jobs that are ready to run
         while not self.capacity or len(self._running) < self.capacity:
-            job = self._queue.pop(now)
+            job = self._queue.pop(now, retryable_blocks=self.sequential)
             if not job:
                 return
             self._running.add(job)
@@ -487,17 +496,17 @@ class ChannelManager(object):
 
     Add a few jobs in channel A with priority 10
 
-    >>> cm.notify(db, 'A', 'A1', 1, 0, 10, None, 'pending')
-    >>> cm.notify(db, 'A', 'A2', 2, 0, 10, None, 'pending')
-    >>> cm.notify(db, 'A', 'A3', 3, 0, 10, None, 'pending')
-    >>> cm.notify(db, 'A', 'A4', 4, 0, 10, None, 'pending')
-    >>> cm.notify(db, 'A', 'A5', 5, 0, 10, None, 'pending')
-    >>> cm.notify(db, 'A', 'A6', 6, 0, 10, None, 'pending')
+    >>> cm.notify(db, 'A', 'A1', 1, 0, 10, None, 'pending', 0)
+    >>> cm.notify(db, 'A', 'A2', 2, 0, 10, None, 'pending', 0)
+    >>> cm.notify(db, 'A', 'A3', 3, 0, 10, None, 'pending', 0)
+    >>> cm.notify(db, 'A', 'A4', 4, 0, 10, None, 'pending', 0)
+    >>> cm.notify(db, 'A', 'A5', 5, 0, 10, None, 'pending', 0)
+    >>> cm.notify(db, 'A', 'A6', 6, 0, 10, None, 'pending', 0)
 
     Add a few jobs in channel B with priority 5
 
-    >>> cm.notify(db, 'B', 'B1', 1, 0, 5, None, 'pending')
-    >>> cm.notify(db, 'B', 'B2', 2, 0, 5, None, 'pending')
+    >>> cm.notify(db, 'B', 'B1', 1, 0, 5, None, 'pending', 0)
+    >>> cm.notify(db, 'B', 'B2', 2, 0, 5, None, 'pending', 0)
 
     We must now run one job from queue B which has a capacity of 1
     and 3 jobs from queue A so the root channel capacity of 4 is filled.
@@ -508,20 +517,20 @@ class ChannelManager(object):
     Job A2 is done. Next job to run is A5, even if we have
     higher priority job in channel B, because channel B has a capacity of 1.
 
-    >>> cm.notify(db, 'A', 'A2', 2, 0, 10, None, 'done')
+    >>> cm.notify(db, 'A', 'A2', 2, 0, 10, None, 'done', 0)
     >>> pp(list(cm.get_jobs_to_run(now=100)))
     [<ChannelJob A4>]
 
     Job B1 is done. Next job to run is B2 because it has higher priority.
 
-    >>> cm.notify(db, 'B', 'B1', 1, 0, 5, None, 'done')
+    >>> cm.notify(db, 'B', 'B1', 1, 0, 5, None, 'done', 0)
     >>> pp(list(cm.get_jobs_to_run(now=100)))
     [<ChannelJob B2>]
 
     Let's say A1 is done and A6 gets a higher priority. A6 will run next.
 
-    >>> cm.notify(db, 'A', 'A1', 1, 0, 10, None, 'done')
-    >>> cm.notify(db, 'A', 'A6', 6, 0, 5, None, 'pending')
+    >>> cm.notify(db, 'A', 'A1', 1, 0, 10, None, 'done', 0)
+    >>> cm.notify(db, 'A', 'A6', 6, 0, 5, None, 'pending', 0)
     >>> pp(list(cm.get_jobs_to_run(now=100)))
     [<ChannelJob A6>]
     """
@@ -724,7 +733,7 @@ class ChannelManager(object):
         return parent
 
     def notify(self, db_name, channel_name, uuid,
-               seq, date_created, priority, eta, state):
+               seq, date_created, priority, eta, state, retry):
         try:
             channel = self.get_channel_by_name(channel_name)
         except ChannelNotFound:
@@ -751,7 +760,7 @@ class ChannelManager(object):
                 job = None
         if not job:
             job = ChannelJob(db_name, channel, uuid,
-                             seq, date_created, priority, eta)
+                             seq, date_created, priority, eta, retry)
             self._jobs_by_uuid[uuid] = job
         # state transitions
         if not state or state == DONE:
